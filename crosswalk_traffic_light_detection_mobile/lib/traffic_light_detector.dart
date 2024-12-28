@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'dart:convert';
+import 'package:flutter/services.dart';
 
 enum TrafficLightStatus {
   red,
@@ -15,8 +16,13 @@ class TrafficLightDetector {
   static const String serverUrl = 'http://175.178.245.188:27015/detect';
   FlutterTts? _flutterTts;
   final bool useChinese;
+  final bool isLandscape;
+  final bool isLeftRotation;
 
-  TrafficLightDetector({this.useChinese = true});
+  TrafficLightDetector(
+      {this.useChinese = true,
+      this.isLandscape = false,
+      this.isLeftRotation = false});
 
   Future<void> initTts() async {
     try {
@@ -37,7 +43,7 @@ class TrafficLightDetector {
     }
   }
 
-  Future<File> _resizeImage(File imageFile) async {
+  Future<File> _processImage(File imageFile) async {
     try {
       // 读取图像文件
       final Uint8List imageBytes = await imageFile.readAsBytes();
@@ -47,6 +53,14 @@ class TrafficLightDetector {
         throw Exception('无法解码图像');
       }
 
+      // 根据设备方向处理图片
+      img.Image processedImage = originalImage;
+      if (isLandscape) {
+        // 如果是横屏，根据旋转方向调整图片
+        processedImage =
+            img.copyRotate(originalImage, angle: isLeftRotation ? 90 : 270);
+      }
+
       // 使用原始图片所在的目录
       final String timestamp = DateTime.now().millisecondsSinceEpoch.toString();
       final File processedFile =
@@ -54,7 +68,7 @@ class TrafficLightDetector {
 
       // 保存图片，仅压缩质量
       await processedFile
-          .writeAsBytes(img.encodeJpg(originalImage, quality: 90));
+          .writeAsBytes(img.encodeJpg(processedImage, quality: 90));
 
       return processedFile;
     } catch (e) {
@@ -64,17 +78,17 @@ class TrafficLightDetector {
   }
 
   Future<TrafficLightStatus> detectTrafficLight(File imageFile) async {
-    File? resizedFile;
+    File? processedFile;
     try {
-      // 调整图像大小
-      resizedFile = await _resizeImage(imageFile);
+      // 处理图像
+      processedFile = await _processImage(imageFile);
 
       // 创建 multipart 请求
       final request = http.MultipartRequest('POST', Uri.parse(serverUrl));
       request.files.add(
         await http.MultipartFile.fromPath(
           'file',
-          resizedFile.path,
+          processedFile.path,
         ),
       );
 
@@ -116,8 +130,8 @@ class TrafficLightDetector {
     } finally {
       // 清理临时文件
       try {
-        if (resizedFile != null && await resizedFile.exists()) {
-          await resizedFile.delete();
+        if (processedFile != null && await processedFile.exists()) {
+          await processedFile.delete();
         }
       } catch (e) {
         print('清理临时文件错误: $e');

@@ -4,6 +4,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'dart:ui';
 import 'dart:io';
 import 'traffic_light_detector.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -45,12 +46,22 @@ class _HomePageState extends State<HomePage> {
   late TrafficLightDetector _detector;
   String _status = '准备就绪';
   bool _isProcessing = false;
+  bool _isLeftRotation = false;
 
   @override
   void initState() {
     super.initState();
     _detector = TrafficLightDetector();
     _initCamera();
+    _initGyroscope();
+  }
+
+  void _initGyroscope() {
+    gyroscopeEvents.listen((GyroscopeEvent event) {
+      setState(() {
+        _isLeftRotation = event.y < 0;
+      });
+    });
   }
 
   Future<void> _initCamera() async {
@@ -89,6 +100,13 @@ class _HomePageState extends State<HomePage> {
     });
 
     try {
+      // 获取当前方向
+      final isLandscape =
+          MediaQuery.of(context).orientation == Orientation.landscape;
+      // 更新检测器
+      _detector = TrafficLightDetector(
+          isLandscape: isLandscape, isLeftRotation: _isLeftRotation);
+
       // 拍照
       final image = await _camera!.takePicture();
       // 检测
