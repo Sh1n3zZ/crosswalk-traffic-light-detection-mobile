@@ -164,6 +164,31 @@ class TrafficLightDetector {
     }
   }
 
+  Future<void> speakResult(TrafficLightStatus status) async {
+    if (_flutterTts == null) {
+      print('TTS 未初始化');
+      return;
+    }
+
+    try {
+      String text;
+      switch (status) {
+        case TrafficLightStatus.red:
+          text = useChinese ? '红灯' : 'Light is red';
+          break;
+        case TrafficLightStatus.green:
+          text = useChinese ? '绿灯' : 'Light is green';
+          break;
+        case TrafficLightStatus.none:
+          text = useChinese ? '没有检测到信号灯' : 'No light detected';
+          break;
+      }
+      await _flutterTts?.speak(text);
+    } catch (e) {
+      print('语音播报错误: $e');
+    }
+  }
+
   void dispose() {
     try {
       _flutterTts?.stop();

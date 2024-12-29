@@ -51,7 +51,7 @@ class _HomePageState extends State<HomePage> {
   String _status = '准备就绪';
   bool _isProcessing = false;
   bool _isLeftRotation = false;
-  bool _isVideoStreamMode = false;
+  bool _isVideoStreamMode = true;
   WebSocketChannel? _channel;
   Timer? _frameCaptureTimer;
 
@@ -61,6 +61,88 @@ class _HomePageState extends State<HomePage> {
     _detector = TrafficLightDetector();
     _initCamera();
     _initGyroscope();
+    // 尝试初始化WebSocket连接
+    _initializeWebSocketMode();
+  }
+
+  Future<void> _initializeWebSocketMode() async {
+    await Future.delayed(Duration(seconds: 1));
+    if (!mounted) return;
+
+    try {
+      await _initWebSocket();
+      if (_isVideoStreamMode) {
+        _startFrameCapture();
+      }
+    } catch (e) {
+      print('初始化错误: $e');
+      if (mounted) {
+        setState(() {
+          _isVideoStreamMode = false;
+        });
+        _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
+      }
+    }
+  }
+
+  Future<void> _initWebSocket() async {
+    try {
+      _channel = WebSocketChannel.connect(
+          Uri.parse('ws://175.178.245.188:27015/ws/video-stream'));
+
+      // 等待连接建立
+      await _channel!.ready;
+
+      _channel!.stream.listen(
+        (message) {
+          // 处理来自服务器的消息
+          final Map<String, dynamic> jsonResponse = json.decode(message);
+          if (mounted) {
+            setState(() {
+              switch (jsonResponse['data']['result']) {
+                case '0':
+                  _status = '检测到红灯';
+                  break;
+                case '1':
+                  _status = '检测到绿灯';
+                  break;
+                default:
+                  _status = '未检测到信号灯';
+                  break;
+              }
+            });
+          }
+        },
+        onDone: () {
+          // 连接关闭时尝试重连
+          if (_isVideoStreamMode && mounted) {
+            Future.delayed(Duration(seconds: 5), () {
+              _initializeWebSocketMode();
+            });
+          }
+        },
+        onError: (error) {
+          print('WebSocket 错误: $error');
+          if (mounted) {
+            setState(() {
+              _isVideoStreamMode = false;
+              _stopFrameCapture();
+            });
+            _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
+          }
+        },
+      );
+    } catch (e) {
+      print('WebSocket 初始化错误: $e');
+      if (mounted) {
+        setState(() {
+          _isVideoStreamMode = false;
+          _stopFrameCapture();
+        });
+        _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
+      }
+      rethrow;
+    }
   }
 
   void _initGyroscope() {
@@ -169,49 +251,43 @@ class _HomePageState extends State<HomePage> {
     _frameCaptureTimer?.cancel();
   }
 
-  void _toggleMode() {
-    setState(() {
-      _isVideoStreamMode = !_isVideoStreamMode;
-      if (_isVideoStreamMode) {
-        _initWebSocket();
+  Future<void> _toggleMode() async {
+    if (!_isVideoStreamMode) {
+      // 从单张拍摄切换到连续识别
+      setState(() {
+        _isVideoStreamMode = true;
+      });
+
+      try {
+        await _initWebSocket();
         _startFrameCapture();
-      } else {
-        _stopFrameCapture();
-        _channel?.sink.close();
+      } catch (e) {
+        print('切换到连续识别模式失败: $e');
+        setState(() {
+          _isVideoStreamMode = false;
+        });
+        _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
       }
-    });
+    } else {
+      // 从连续识别切换到单张拍摄
+      setState(() {
+        _isVideoStreamMode = false;
+      });
+      _stopFrameCapture();
+      _channel?.sink.close();
+    }
   }
 
-  void _initWebSocket() {
-    _channel = WebSocketChannel.connect(
-        Uri.parse('ws://175.178.245.188:27015/ws/video-stream'));
-    _channel!.stream.listen((message) {
-      // 处理来自服务器的消息
-      final Map<String, dynamic> jsonResponse = json.decode(message);
-      setState(() {
-        switch (jsonResponse['data']['result']) {
-          case '0':
-            _status = '检测到红灯';
-            break;
-          case '1':
-            _status = '检测到绿灯';
-            break;
-          default:
-            _status = '未检测到信号灯';
-            break;
-        }
-      });
-    }, onDone: () {
-      // 连接关闭时尝试重连
-      if (_isVideoStreamMode) {
-        Future.delayed(Duration(seconds: 5), () {
-          _initWebSocket();
-        });
-      }
-    }, onError: (error) {
-      // 处理错误
-      print('WebSocket 错误: $error');
-    });
+  void _showErrorSnackBar(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: Colors.red,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
   }
 
   @override
@@ -243,9 +319,6 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
-
-    // 定义一个布尔变量来控制按钮的显示
-    bool showToggleButton = false;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -351,8 +424,7 @@ class _HomePageState extends State<HomePage> {
                               width: double.infinity,
                               height: 56,
                               child: ElevatedButton(
-                                onPressed:
-                                    _isProcessing ? null : _detectTrafficLight,
+                                onPressed: _toggleMode,
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: const Color(0xFF2C3E50),
                                   foregroundColor: Colors.white,
@@ -362,7 +434,7 @@ class _HomePageState extends State<HomePage> {
                                   elevation: 0,
                                 ),
                                 child: Text(
-                                  _isProcessing ? '识别中...' : '开始识别',
+                                  _isVideoStreamMode ? '切换到单张拍摄' : '切换到连续识别',
                                   style: const TextStyle(
                                     fontSize: 18,
                                     fontWeight: FontWeight.w600,
@@ -370,9 +442,37 @@ class _HomePageState extends State<HomePage> {
                                 ),
                               ),
                             ),
-                            const SizedBox(height: 16),
+                            const SizedBox(height: 24),
+                            if (!_isVideoStreamMode)
+                              SizedBox(
+                                width: double.infinity,
+                                height: 56,
+                                child: ElevatedButton(
+                                  onPressed: _isProcessing
+                                      ? null
+                                      : _detectTrafficLight,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFF2C3E50),
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16),
+                                    ),
+                                    elevation: 0,
+                                  ),
+                                  child: Text(
+                                    _isProcessing ? '识别中...' : '开始识别',
+                                    style: const TextStyle(
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            if (!_isVideoStreamMode) const SizedBox(height: 16),
                             Text(
-                              '将手机对准红绿灯，点击按钮开始识别',
+                              _isVideoStreamMode
+                                  ? '正在连续识别中...'
+                                  : '将手机对准红绿灯，点击按钮开始识别',
                               style: TextStyle(
                                 color: Colors.grey[600],
                                 fontSize: 14,
@@ -466,8 +566,7 @@ class _HomePageState extends State<HomePage> {
                               width: double.infinity,
                               height: 56,
                               child: ElevatedButton(
-                                onPressed:
-                                    _isProcessing ? null : _detectTrafficLight,
+                                onPressed: _toggleMode,
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: const Color(0xFF2C3E50),
                                   foregroundColor: Colors.white,
@@ -477,7 +576,7 @@ class _HomePageState extends State<HomePage> {
                                   elevation: 0,
                                 ),
                                 child: Text(
-                                  _isProcessing ? '识别中...' : '开始识别',
+                                  _isVideoStreamMode ? '切换到单张拍摄' : '切换到连续识别',
                                   style: const TextStyle(
                                     fontSize: 18,
                                     fontWeight: FontWeight.w600,
@@ -485,29 +584,48 @@ class _HomePageState extends State<HomePage> {
                                 ),
                               ),
                             ),
-                            const SizedBox(height: 16),
+                            const SizedBox(height: 24),
+                            if (!_isVideoStreamMode)
+                              SizedBox(
+                                width: double.infinity,
+                                height: 56,
+                                child: ElevatedButton(
+                                  onPressed: _isProcessing
+                                      ? null
+                                      : _detectTrafficLight,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFF2C3E50),
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16),
+                                    ),
+                                    elevation: 0,
+                                  ),
+                                  child: Text(
+                                    _isProcessing ? '识别中...' : '开始识别',
+                                    style: const TextStyle(
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            if (!_isVideoStreamMode) const SizedBox(height: 16),
                             Text(
-                              '将手机对准红绿灯，点击按钮开始识别',
+                              _isVideoStreamMode
+                                  ? '正在连续识别中...'
+                                  : '将手机对准红绿灯，点击按钮开始识别',
                               style: TextStyle(
                                 color: Colors.grey[600],
                                 fontSize: 14,
                               ),
+                              textAlign: TextAlign.center,
                             ),
                           ],
                         ),
                       ),
                     ],
                   ),
-            if (showToggleButton) // 根据条件显示按钮
-              Positioned(
-                bottom: 20,
-                right: 20,
-                child: FloatingActionButton(
-                  onPressed: _toggleMode,
-                  child: Icon(
-                      _isVideoStreamMode ? Icons.photo_camera : Icons.videocam),
-                ),
-              ),
           ],
         ),
       ),
