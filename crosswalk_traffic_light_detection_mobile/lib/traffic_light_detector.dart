@@ -2,8 +2,8 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
-import 'package:flutter_tts/flutter_tts.dart';
 import 'dart:convert';
+import 'dart:async';
 import 'package:flutter/services.dart';
 
 enum TrafficLightStatus {
@@ -14,34 +14,13 @@ enum TrafficLightStatus {
 
 class TrafficLightDetector {
   static const String serverUrl = 'https://cr.rakuyou.uk/detect';
-  FlutterTts? _flutterTts;
-  final bool useChinese;
   final bool isLandscape;
   final bool isLeftRotation;
 
-  TrafficLightDetector(
-      {this.useChinese = true,
-      this.isLandscape = false,
-      this.isLeftRotation = false});
-
-  Future<void> initTts() async {
-    try {
-      _flutterTts = FlutterTts();
-
-      if (useChinese) {
-        await _flutterTts?.setLanguage('zh-CN');
-        await _flutterTts?.setSpeechRate(0.8);
-      } else {
-        await _flutterTts?.setLanguage('en-US');
-        await _flutterTts?.setSpeechRate(0.5);
-      }
-      await _flutterTts?.setVolume(1.0);
-      await _flutterTts?.setPitch(1.0);
-    } catch (e) {
-      print('TTS 初始化错误: $e');
-      _flutterTts = null;
-    }
-  }
+  TrafficLightDetector({
+    this.isLandscape = false,
+    this.isLeftRotation = false,
+  });
 
   Future<File> _processImage(File imageFile) async {
     try {
@@ -92,8 +71,14 @@ class TrafficLightDetector {
         ),
       );
 
-      // 发送请求并等待响应
-      final response = await request.send();
+      // 设置超时时间为10秒
+      final response = await request.send().timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          throw TimeoutException('请求超时');
+        },
+      );
+
       final String result = await response.stream.bytesToString();
       print('服务器返回结果: $result');
 
@@ -107,21 +92,18 @@ class TrafficLightDetector {
           // 解析响应
           switch (result) {
             case '1':
-              await _speakResult(TrafficLightStatus.green);
               return TrafficLightStatus.green;
             case '0':
-              await _speakResult(TrafficLightStatus.red);
               return TrafficLightStatus.red;
             default:
-              await _speakResult(TrafficLightStatus.none);
               return TrafficLightStatus.none;
           }
         } else {
+          print('服务器响应格式错误: $jsonResponse');
           throw Exception('服务器响应格式错误');
         }
-      } else if (response.statusCode == 422) {
-        throw Exception('请求参数错误');
       } else {
+        print('服务器响应错误状态码: ${response.statusCode}');
         throw Exception('服务器响应错误: ${response.statusCode}');
       }
     } catch (e) {
@@ -139,62 +121,5 @@ class TrafficLightDetector {
     }
   }
 
-  Future<void> _speakResult(TrafficLightStatus status) async {
-    if (_flutterTts == null) {
-      print('TTS 未初始化');
-      return;
-    }
-
-    try {
-      String text;
-      switch (status) {
-        case TrafficLightStatus.red:
-          text = useChinese ? '红灯' : 'Light is red';
-          break;
-        case TrafficLightStatus.green:
-          text = useChinese ? '绿灯' : 'Light is green';
-          break;
-        case TrafficLightStatus.none:
-          text = useChinese ? '没有检测到信号灯' : 'No light detected';
-          break;
-      }
-      await _flutterTts?.speak(text);
-    } catch (e) {
-      print('语音播报错误: $e');
-    }
-  }
-
-  Future<void> speakResult(TrafficLightStatus status) async {
-    if (_flutterTts == null) {
-      print('TTS 未初始化');
-      return;
-    }
-
-    try {
-      String text;
-      switch (status) {
-        case TrafficLightStatus.red:
-          text = useChinese ? '红灯' : 'Light is red';
-          break;
-        case TrafficLightStatus.green:
-          text = useChinese ? '绿灯' : 'Light is green';
-          break;
-        case TrafficLightStatus.none:
-          text = useChinese ? '没有检测到信号灯' : 'No light detected';
-          break;
-      }
-      await _flutterTts?.speak(text);
-    } catch (e) {
-      print('语音播报错误: $e');
-    }
-  }
-
-  void dispose() {
-    try {
-      _flutterTts?.stop();
-      _flutterTts = null;
-    } catch (e) {
-      print('TTS 停止错误: $e');
-    }
-  }
+  void dispose() {}
 }
