@@ -5,6 +5,10 @@ import 'dart:ui';
 import 'dart:io';
 import 'traffic_light_detector.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'dart:convert';
+import 'dart:async';
+import 'image_processor.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -47,6 +51,9 @@ class _HomePageState extends State<HomePage> {
   String _status = '准备就绪';
   bool _isProcessing = false;
   bool _isLeftRotation = false;
+  bool _isVideoStreamMode = false;
+  WebSocketChannel? _channel;
+  Timer? _frameCaptureTimer;
 
   @override
   void initState() {
@@ -59,7 +66,7 @@ class _HomePageState extends State<HomePage> {
   void _initGyroscope() {
     gyroscopeEvents.listen((GyroscopeEvent event) {
       setState(() {
-        _isLeftRotation = event.y < 0;
+        _isLeftRotation = event.y < -0.5;
       });
     });
   }
@@ -134,10 +141,85 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  void _startFrameCapture() {
+    _frameCaptureTimer =
+        Timer.periodic(Duration(milliseconds: 100), (timer) async {
+      if (_camera != null && _camera!.value.isInitialized && !_isProcessing) {
+        setState(() {
+          _isProcessing = true;
+        });
+        final image = await _camera!.takePicture();
+        final bytes = await image.readAsBytes();
+        final isLandscape =
+            MediaQuery.of(context).orientation == Orientation.landscape;
+        final processedBytes =
+            await processImageOrientation(bytes, isLandscape, _isLeftRotation);
+        final base64Image = base64Encode(processedBytes);
+        if (_channel != null && _channel!.sink != null && _isVideoStreamMode) {
+          _channel!.sink.add(json.encode({'image': base64Image}));
+        }
+        setState(() {
+          _isProcessing = false;
+        });
+      }
+    });
+  }
+
+  void _stopFrameCapture() {
+    _frameCaptureTimer?.cancel();
+  }
+
+  void _toggleMode() {
+    setState(() {
+      _isVideoStreamMode = !_isVideoStreamMode;
+      if (_isVideoStreamMode) {
+        _initWebSocket();
+        _startFrameCapture();
+      } else {
+        _stopFrameCapture();
+        _channel?.sink.close();
+      }
+    });
+  }
+
+  void _initWebSocket() {
+    _channel = WebSocketChannel.connect(
+        Uri.parse('ws://175.178.245.188:27015/ws/video-stream'));
+    _channel!.stream.listen((message) {
+      // 处理来自服务器的消息
+      final Map<String, dynamic> jsonResponse = json.decode(message);
+      setState(() {
+        switch (jsonResponse['data']['result']) {
+          case '0':
+            _status = '检测到红灯';
+            break;
+          case '1':
+            _status = '检测到绿灯';
+            break;
+          default:
+            _status = '未检测到信号灯';
+            break;
+        }
+      });
+    }, onDone: () {
+      // 连接关闭时尝试重连
+      if (_isVideoStreamMode) {
+        Future.delayed(Duration(seconds: 5), () {
+          _initWebSocket();
+        });
+      }
+    }, onError: (error) {
+      // 处理错误
+      print('WebSocket 错误: $error');
+    });
+  }
+
   @override
   void dispose() {
+    _stopFrameCapture();
     _camera?.dispose();
     _detector.dispose();
+    _channel?.sink.close();
     super.dispose();
   }
 
@@ -161,6 +243,9 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
+
+    // 定义一个布尔变量来控制按钮的显示
+    bool showToggleButton = false;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -413,6 +498,16 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ],
                   ),
+            if (showToggleButton) // 根据条件显示按钮
+              Positioned(
+                bottom: 20,
+                right: 20,
+                child: FloatingActionButton(
+                  onPressed: _toggleMode,
+                  child: Icon(
+                      _isVideoStreamMode ? Icons.photo_camera : Icons.videocam),
+                ),
+              ),
           ],
         ),
       ),
