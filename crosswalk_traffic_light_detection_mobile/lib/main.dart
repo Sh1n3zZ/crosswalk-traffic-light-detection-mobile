@@ -10,6 +10,7 @@ import 'dart:async';
 import 'package:just_audio/just_audio.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:vibration/vibration.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -286,13 +287,41 @@ class _HomePageState extends State<HomePage>
       _channel = WebSocketChannel.connect(
           Uri.parse('ws://175.178.245.188:27015/ws/video-stream'));
 
-      // 添加超时处理
       await _channel!.ready.timeout(
         const Duration(seconds: 5),
         onTimeout: () {
           throw TimeoutException('WebSocket连接超时');
         },
       );
+
+      // 启动定时发送图像的定时器
+      Timer.periodic(const Duration(milliseconds: 500), (timer) async {
+        if (!_isVideoStreamMode) {
+          timer.cancel();
+          return;
+        }
+
+        if (_camera != null && _camera!.value.isInitialized) {
+          try {
+            final XFile image = await _camera!.takePicture();
+            final bytes = await image.readAsBytes();
+
+            // 压缩图片
+            final img = await decodeImageFromList(bytes);
+            final resizedImg = await FlutterImageCompress.compressWithList(
+              bytes,
+              minHeight: 480, // 设置最小高度
+              minWidth: 640, // 设置最小宽度
+              quality: 80, // 设置压缩质量
+              rotate: 0, // 不旋转
+            );
+
+            _channel!.sink.add(resizedImg);
+          } catch (e) {
+            print('拍照或发送失败: $e');
+          }
+        }
+      });
 
       _channel!.stream.listen(
         (message) {
@@ -307,8 +336,7 @@ class _HomePageState extends State<HomePage>
 
                 switch (data['result']) {
                   case '0':
-                    _status =
-                        '检测到${data['status']} (插值预测: ${data['interpolated']})';
+                    _status = '检测到${data['status']}';
                     if (shouldSpeak) {
                       _speakResult('红灯');
                       _lastSpeakTime = now;
@@ -316,15 +344,14 @@ class _HomePageState extends State<HomePage>
                     _showGlowEffect(Colors.red);
                     break;
                   case '1':
-                    _status =
-                        '检测到${data['status']} (插值预测: ${data['interpolated']})';
+                    _status = '检测到${data['status']}';
                     if (shouldSpeak) {
                       _speakResult('绿灯');
                       _lastSpeakTime = now;
                     }
                     _showGlowEffect(Colors.green);
                     break;
-                  default:
+                  case '2':
                     _status = data['status'];
                     if (shouldSpeak) {
                       _speakResult('未检测到信号灯');
@@ -334,10 +361,13 @@ class _HomePageState extends State<HomePage>
                     break;
                 }
               });
+            } else {
+              print('服务器响应错误: ${jsonResponse['message']}');
             }
           }
         },
         onDone: () {
+          print('WebSocket连接已关闭');
           if (_isVideoStreamMode && mounted) {
             Future.delayed(Duration(seconds: 5), () {
               _initializeWebSocketMode();
@@ -382,16 +412,18 @@ class _HomePageState extends State<HomePage>
     // 使用较低的分辨率和更高效的图像格式
     _camera = CameraController(
       cameras[0],
-      ResolutionPreset.veryHigh,
-      enableAudio: false, // 禁用音频
+      ResolutionPreset.medium, // 降低分辨率，从 veryHigh 改为 medium
+      enableAudio: false,
       imageFormatGroup: Platform.isAndroid
           ? ImageFormatGroup.jpeg
-          : ImageFormatGroup.bgra8888, // 使用更高效的图像格式
+          : ImageFormatGroup.bgra8888,
     );
 
     try {
       await _camera!.initialize();
-      setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     } catch (e) {
       setState(() => _status = '相机初始化失败');
     }
