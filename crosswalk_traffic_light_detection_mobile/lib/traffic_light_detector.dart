@@ -18,7 +18,7 @@ class TrafficLightDetector {
   TrafficLightDetector();
 
   Future<TrafficLightStatus> detectTrafficLight(File imageFile) async {
-    File? processedFile;
+    File? tempFile;
     try {
       // 读取图像文件
       final Uint8List imageBytes = await imageFile.readAsBytes();
@@ -30,6 +30,7 @@ class TrafficLightDetector {
       final String timestamp = DateTime.now().millisecondsSinceEpoch.toString();
       final File processedFile =
           File('${imageFile.parent.path}/processed_$timestamp.jpg');
+      tempFile = processedFile;
 
       // 保存处理后的图片
       await processedFile.writeAsBytes(processedBytes);
@@ -82,8 +83,8 @@ class TrafficLightDetector {
     } finally {
       // 清理临时文件
       try {
-        if (processedFile != null && await processedFile.exists()) {
-          await processedFile.delete();
+        if (tempFile != null && await tempFile.exists()) {
+          await tempFile.delete();
         }
       } catch (e) {
         print('清理临时文件错误: $e');

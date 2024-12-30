@@ -7,12 +7,9 @@ import 'traffic_light_detector.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'dart:convert';
 import 'dart:async';
-import 'image_processor.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:vibration/vibration.dart';
-import 'dart:collection';
-import 'dart:typed_data';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
