@@ -1,10 +1,10 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
-import 'package:image/image.dart' as img;
 import 'dart:convert';
 import 'dart:async';
 import 'package:flutter/services.dart';
+import 'image_processor.dart';
 
 enum TrafficLightStatus {
   red,
@@ -13,54 +13,26 @@ enum TrafficLightStatus {
 }
 
 class TrafficLightDetector {
-  static const String serverUrl = 'https://cr.rakuyou.uk/detect';
-  final bool isLandscape;
-  final bool isLeftRotation;
+  static const String serverUrl = 'http://175.178.245.188:27015/detect';
 
-  TrafficLightDetector({
-    this.isLandscape = false,
-    this.isLeftRotation = false,
-  });
+  TrafficLightDetector();
 
-  Future<File> _processImage(File imageFile) async {
+  Future<TrafficLightStatus> detectTrafficLight(File imageFile) async {
+    File? processedFile;
     try {
       // 读取图像文件
       final Uint8List imageBytes = await imageFile.readAsBytes();
-      final img.Image? originalImage = img.decodeImage(imageBytes);
 
-      if (originalImage == null) {
-        throw Exception('无法解码图像');
-      }
-
-      // 根据设备方向处理图片
-      img.Image processedImage = originalImage;
-      if (isLandscape) {
-        // 如果是横屏，根据旋转方向调整图片
-        processedImage =
-            img.copyRotate(originalImage, angle: isLeftRotation ? 90 : 270);
-      }
+      // 使用简化的图像处理
+      final Uint8List processedBytes = await processImage(imageBytes);
 
       // 使用原始图片所在的目录
       final String timestamp = DateTime.now().millisecondsSinceEpoch.toString();
       final File processedFile =
           File('${imageFile.parent.path}/processed_$timestamp.jpg');
 
-      // 保存图片，仅压缩质量
-      await processedFile
-          .writeAsBytes(img.encodeJpg(processedImage, quality: 90));
-
-      return processedFile;
-    } catch (e) {
-      print('图像处理错误: $e');
-      rethrow;
-    }
-  }
-
-  Future<TrafficLightStatus> detectTrafficLight(File imageFile) async {
-    File? processedFile;
-    try {
-      // 处理图像
-      processedFile = await _processImage(imageFile);
+      // 保存处理后的图片
+      await processedFile.writeAsBytes(processedBytes);
 
       // 创建 multipart 请求
       final request = http.MultipartRequest('POST', Uri.parse(serverUrl));
@@ -83,13 +55,11 @@ class TrafficLightDetector {
       print('服务器返回结果: $result');
 
       if (response.statusCode == 200) {
-        // 解析 JSON 响应
         final Map<String, dynamic> jsonResponse = json.decode(result);
 
         if (jsonResponse['code'] == 200 && jsonResponse['data'] != null) {
           final String result = jsonResponse['data']['result'] ?? '2';
 
-          // 解析响应
           switch (result) {
             case '1':
               return TrafficLightStatus.green;

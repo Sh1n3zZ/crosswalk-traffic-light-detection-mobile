@@ -4,12 +4,15 @@ import 'package:permission_handler/permission_handler.dart';
 import 'dart:ui';
 import 'dart:io';
 import 'traffic_light_detector.dart';
-import 'package:sensors_plus/sensors_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'image_processor.dart';
-import 'package:flutter_tts/flutter_tts.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:audio_session/audio_session.dart';
+import 'package:vibration/vibration.dart';
+import 'dart:collection';
+import 'dart:typed_data';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -47,109 +50,220 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   CameraController? _camera;
   late TrafficLightDetector _detector;
   String _status = '准备就绪';
   bool _isProcessing = false;
-  bool _isLeftRotation = false;
-  bool _isVideoStreamMode = true;
+  bool _isVideoStreamMode = false;
   WebSocketChannel? _channel;
-  Timer? _frameCaptureTimer;
-  FlutterTts? _flutterTts;
+
+  // 音频播放器
+  final AudioPlayer _redLightPlayer = AudioPlayer();
+  final AudioPlayer _greenLightPlayer = AudioPlayer();
+  final AudioPlayer _noLightPlayer = AudioPlayer();
+  bool _isAudioReady = false;
 
   // 添加动画控制器和颜色状态
   late AnimationController _glowController;
   Color _glowColor = Colors.transparent;
   Timer? _glowTimer;
+  Timer? _vibrationTimer;
+
+  // 添加语音播报控制变量
+  DateTime? _lastSpeakTime;
+  static const Duration _minSpeakInterval =
+      Duration(seconds: 30); // 设置最小播报间隔为30秒
 
   @override
   void initState() {
     super.initState();
-    _initTts();
-    _detector = TrafficLightDetector();
-    _initCamera();
-    _initGyroscope();
-
-    // 初始化动画控制器
+    ambiguate(WidgetsBinding.instance)!.addObserver(this);
     _glowController = AnimationController(
       duration: const Duration(milliseconds: 1000),
       vsync: this,
     );
-    _glowController.repeat(reverse: true);
+    _detector = TrafficLightDetector();
 
-    // 尝试初始化WebSocket连接
-    _initializeWebSocketMode();
+    // 使用异步初始化
+    _initializeApp();
   }
 
-  Future<void> _initTts() async {
+  Future<void> _initializeApp() async {
     try {
-      _flutterTts = FlutterTts();
-
-      // 检查TTS引擎是否可用
-      final available =
-          await _flutterTts?.isLanguageAvailable("zh-CN") ?? false;
-      print('TTS引擎是否可用: $available');
-
-      if (!available) {
-        print('TTS引擎不支持中文');
-        return;
+      await _checkPermissions();
+      await _initAudioPlayers();
+      await _initCamera();
+      if (mounted) {
+        await _initializeWebSocketMode();
       }
-
-      // 获取可用的语音引擎
-      final engines = await _flutterTts?.getEngines;
-      print('可用的语音引擎: $engines');
-
-      // 设置TTS参数
-      await _flutterTts?.setLanguage('zh-CN');
-      await _flutterTts?.setSpeechRate(0.8);
-      await _flutterTts?.setVolume(1.0);
-      await _flutterTts?.setPitch(1.0);
-      await _flutterTts?.awaitSpeakCompletion(true);
-
-      // 设置TTS状态回调
-      _flutterTts?.setStartHandler(() {
-        print("TTS开始播放");
-      });
-
-      _flutterTts?.setCompletionHandler(() {
-        print("TTS播放完成");
-      });
-
-      _flutterTts?.setErrorHandler((msg) {
-        print("TTS错误: $msg");
-      });
-
-      // 测试TTS是否正常工作
-      print('开始测试TTS...');
-      final result = await _flutterTts?.speak('语音系统已就绪');
-      print('TTS测试结果: $result');
     } catch (e) {
-      print('TTS 初始化错误: $e');
-      _flutterTts = null;
+      print('初始化错误: $e');
+      if (mounted) {
+        _showErrorSnackBar('应用初始化失败，请重启应用');
+      }
     }
   }
 
-  Future<void> _speakResult(String text) async {
-    try {
-      if (_flutterTts == null) {
-        print('TTS未初始化，重新初始化中...');
-        await _initTts();
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      // 当应用进入后台时释放音频资源
+      _redLightPlayer.stop();
+      _greenLightPlayer.stop();
+      _noLightPlayer.stop();
+    }
+  }
+
+  Future<void> _checkPermissions() async {
+    // 检查所有需要的权限状态
+    final cameraStatus = await Permission.camera.status;
+    final microphoneStatus = await Permission.microphone.status;
+    final storageStatus = await Permission.storage.status;
+
+    print('权限状态检查:');
+    print('相机权限: ${cameraStatus.toString()}');
+    print('麦克风权限: ${microphoneStatus.toString()}');
+    print('存储权限: ${storageStatus.toString()}');
+
+    // 如果权限未授予，请求权限
+    if (!cameraStatus.isGranted) {
+      final cameraResult = await Permission.camera.request();
+      print('相机权限请求结果: ${cameraResult.toString()}');
+    }
+    if (!microphoneStatus.isGranted) {
+      final microphoneResult = await Permission.microphone.request();
+      print('麦克风权限请求结果: ${microphoneResult.toString()}');
+    }
+    if (!storageStatus.isGranted) {
+      final storageResult = await Permission.storage.request();
+      print('存储权限请求结果: ${storageResult.toString()}');
+    }
+  }
+
+  Future<void> _initAudioPlayers() async {
+    int retryCount = 0;
+    const maxRetries = 3;
+
+    Future<void> initAudio() async {
+      try {
+        // 确保已获取音频权限
+        final permission = await Permission.microphone.request();
+        if (!permission.isGranted) {
+          print('未获得音频权限，尝试重新请求');
+          throw Exception('音频权限未授予');
+        }
+
+        // 配置音频会话
+        final session = await AudioSession.instance;
+        await session.configure(const AudioSessionConfiguration(
+          avAudioSessionCategory: AVAudioSessionCategory.playback,
+          androidAudioAttributes: AndroidAudioAttributes(
+            contentType: AndroidAudioContentType.speech,
+            usage: AndroidAudioUsage.assistanceAccessibility,
+          ),
+        ));
+
+        // 设置错误监听
+        void handleError(String player, Object e, StackTrace? stackTrace) {
+          print('$player 播放错误: $e');
+        }
+
+        _redLightPlayer.playbackEventStream.listen(
+          (event) {},
+          onError: (Object e, StackTrace stackTrace) =>
+              handleError('红灯语音', e, stackTrace),
+        );
+
+        _greenLightPlayer.playbackEventStream.listen(
+          (event) {},
+          onError: (Object e, StackTrace stackTrace) =>
+              handleError('绿灯语音', e, stackTrace),
+        );
+
+        _noLightPlayer.playbackEventStream.listen(
+          (event) {},
+          onError: (Object e, StackTrace stackTrace) =>
+              handleError('无信号灯语音', e, stackTrace),
+        );
+
+        // 使用 wav 格式的音频文件
+        await Future.wait([
+          _redLightPlayer.setAsset(
+              'assets/audio/_tmp_gradio_572c5ad306024f103a35cfad0d01a1184f754836_audio.wav'),
+          _greenLightPlayer.setAsset(
+              'assets/audio/_tmp_gradio_3456314a2eb57f79a178bec1cadfcb5bd36662f1_audio.wav'),
+          _noLightPlayer.setAsset(
+              'assets/audio/_tmp_gradio_bc1ffe32d82d3dee94c1043942b8adf60af00b4e_audio.wav'),
+        ]);
+
+        // 设置音量
+        await Future.wait([
+          _redLightPlayer.setVolume(1.0),
+          _greenLightPlayer.setVolume(1.0),
+          _noLightPlayer.setVolume(1.0),
+        ]);
+
+        _isAudioReady = true;
+        print('音频初始化成功');
+      } catch (e) {
+        print('音频初始化失败: $e');
+        _isAudioReady = false;
+
+        if (retryCount < maxRetries) {
+          retryCount++;
+          print('尝试重新初始化音频系统 (第 $retryCount 次)');
+          await Future.delayed(Duration(seconds: 2));
+          await initAudio();
+        } else {
+          print('音频初始化失败次数过多，请检查设备权限和音频设置');
+          if (mounted) {
+            _showErrorSnackBar('音频系统初始化失败，部分功能可能无法使用');
+          }
+        }
       }
+    }
 
-      if (_flutterTts != null) {
-        print('正在播放语音: $text');
-        // 先停止之前的语音
-        await _flutterTts?.stop();
+    await initAudio();
+  }
 
-        // 播放新的语音
-        final result = await _flutterTts?.speak(text);
-        print('语音播放结果: $result');
-      } else {
-        print('TTS仍然未初始化');
+  Future<void> _speakResult(String text) async {
+    if (!_isAudioReady) {
+      print('音频系统未就绪，尝试重新初始化');
+      await _initAudioPlayers();
+      if (!_isAudioReady) {
+        print('重新初始化失败，无法播放音频');
+        return;
+      }
+    }
+
+    try {
+      // 停止所有正在播放的音频
+      await Future.wait([
+        _redLightPlayer.stop(),
+        _greenLightPlayer.stop(),
+        _noLightPlayer.stop(),
+      ]);
+
+      // 播放对应的音频
+      switch (text) {
+        case '红灯':
+          await _redLightPlayer.seek(Duration.zero);
+          await _redLightPlayer.play();
+          break;
+        case '绿灯':
+          await _greenLightPlayer.seek(Duration.zero);
+          await _greenLightPlayer.play();
+          break;
+        case '未检测到信号灯':
+          await _noLightPlayer.seek(Duration.zero);
+          await _noLightPlayer.play();
+          break;
       }
     } catch (e) {
-      print('语音播报错误: $e');
+      print('音频播放错误: $e');
+      // 如果播放出错，标记音频系统为未就绪，下次将重新初始化
+      _isAudioReady = false;
     }
   }
 
@@ -159,9 +273,6 @@ class _HomePageState extends State<HomePage>
 
     try {
       await _initWebSocket();
-      if (_isVideoStreamMode) {
-        _startFrameCapture();
-      }
     } catch (e) {
       print('初始化错误: $e');
       if (mounted) {
@@ -178,37 +289,58 @@ class _HomePageState extends State<HomePage>
       _channel = WebSocketChannel.connect(
           Uri.parse('ws://175.178.245.188:27015/ws/video-stream'));
 
-      // 等待连接建立
-      await _channel!.ready;
+      // 添加超时处理
+      await _channel!.ready.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          throw TimeoutException('WebSocket连接超时');
+        },
+      );
 
       _channel!.stream.listen(
         (message) {
-          // 处理来自服务器的消息
-          final Map<String, dynamic> jsonResponse = json.decode(message);
-          if (mounted) {
-            setState(() {
-              switch (jsonResponse['data']['result']) {
-                case '0':
-                  _status = '检测到红灯';
-                  _speakResult('红灯');
-                  _showGlowEffect(Colors.red);
-                  break;
-                case '1':
-                  _status = '检测到绿灯';
-                  _speakResult('绿灯');
-                  _showGlowEffect(Colors.green);
-                  break;
-                default:
-                  _status = '未检测到信号灯';
-                  _speakResult('未检测到信号灯');
-                  _showGlowEffect(Colors.transparent);
-                  break;
-              }
-            });
+          if (message is String) {
+            final Map<String, dynamic> jsonResponse = json.decode(message);
+            if (mounted && jsonResponse['code'] == 200) {
+              final data = jsonResponse['data'];
+              setState(() {
+                final now = DateTime.now();
+                final shouldSpeak = _lastSpeakTime == null ||
+                    now.difference(_lastSpeakTime!) >= _minSpeakInterval;
+
+                switch (data['result']) {
+                  case '0':
+                    _status =
+                        '检测到${data['status']} (插值预测: ${data['interpolated']})';
+                    if (shouldSpeak) {
+                      _speakResult('红灯');
+                      _lastSpeakTime = now;
+                    }
+                    _showGlowEffect(Colors.red);
+                    break;
+                  case '1':
+                    _status =
+                        '检测到${data['status']} (插值预测: ${data['interpolated']})';
+                    if (shouldSpeak) {
+                      _speakResult('绿灯');
+                      _lastSpeakTime = now;
+                    }
+                    _showGlowEffect(Colors.green);
+                    break;
+                  default:
+                    _status = data['status'];
+                    if (shouldSpeak) {
+                      _speakResult('未检测到信号灯');
+                      _lastSpeakTime = now;
+                    }
+                    _showGlowEffect(Colors.transparent);
+                    break;
+                }
+              });
+            }
           }
         },
         onDone: () {
-          // 连接关闭时尝试重连
           if (_isVideoStreamMode && mounted) {
             Future.delayed(Duration(seconds: 5), () {
               _initializeWebSocketMode();
@@ -220,7 +352,6 @@ class _HomePageState extends State<HomePage>
           if (mounted) {
             setState(() {
               _isVideoStreamMode = false;
-              _stopFrameCapture();
             });
             _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
           }
@@ -231,7 +362,6 @@ class _HomePageState extends State<HomePage>
       if (mounted) {
         setState(() {
           _isVideoStreamMode = false;
-          _stopFrameCapture();
         });
         _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
       }
@@ -239,31 +369,29 @@ class _HomePageState extends State<HomePage>
     }
   }
 
-  void _initGyroscope() {
-    gyroscopeEvents.listen((GyroscopeEvent event) {
-      setState(() {
-        _isLeftRotation = event.y < -0.5;
-      });
-    });
-  }
-
   Future<void> _initCamera() async {
-    // 请求相机权限
     final permission = await Permission.camera.request();
     if (!permission.isGranted) {
       setState(() => _status = '需要相机权限');
       return;
     }
 
-    // 获取相机列表
     final cameras = await availableCameras();
     if (cameras.isEmpty) {
       setState(() => _status = '没有可用的相机');
       return;
     }
 
-    // 初始化相机
-    _camera = CameraController(cameras[0], ResolutionPreset.medium);
+    // 使用较低的分辨率和更高效的图像格式
+    _camera = CameraController(
+      cameras[0],
+      ResolutionPreset.veryHigh,
+      enableAudio: false, // 禁用音频
+      imageFormatGroup: Platform.isAndroid
+          ? ImageFormatGroup.jpeg
+          : ImageFormatGroup.bgra8888, // 使用更高效的图像格式
+    );
+
     try {
       await _camera!.initialize();
       setState(() {});
@@ -283,12 +411,7 @@ class _HomePageState extends State<HomePage>
     });
 
     try {
-      // 获取当前方向
-      final isLandscape =
-          MediaQuery.of(context).orientation == Orientation.landscape;
-      // 更新检测器
-      _detector = TrafficLightDetector(
-          isLandscape: isLandscape, isLeftRotation: _isLeftRotation);
+      _detector = TrafficLightDetector();
 
       // 拍照
       final image = await _camera!.takePicture();
@@ -331,44 +454,14 @@ class _HomePageState extends State<HomePage>
     }
   }
 
-  void _startFrameCapture() {
-    _frameCaptureTimer =
-        Timer.periodic(Duration(milliseconds: 100), (timer) async {
-      if (_camera != null && _camera!.value.isInitialized && !_isProcessing) {
-        setState(() {
-          _isProcessing = true;
-        });
-        final image = await _camera!.takePicture();
-        final bytes = await image.readAsBytes();
-        final isLandscape =
-            MediaQuery.of(context).orientation == Orientation.landscape;
-        final processedBytes =
-            await processImageOrientation(bytes, isLandscape, _isLeftRotation);
-        final base64Image = base64Encode(processedBytes);
-        if (_channel != null && _channel!.sink != null && _isVideoStreamMode) {
-          _channel!.sink.add(json.encode({'image': base64Image}));
-        }
-        setState(() {
-          _isProcessing = false;
-        });
-      }
-    });
-  }
-
-  void _stopFrameCapture() {
-    _frameCaptureTimer?.cancel();
-  }
-
   Future<void> _toggleMode() async {
     if (!_isVideoStreamMode) {
-      // 从单张拍摄切换到连续识别
       setState(() {
         _isVideoStreamMode = true;
       });
 
       try {
         await _initWebSocket();
-        _startFrameCapture();
       } catch (e) {
         print('切换到连续识别模式失败: $e');
         setState(() {
@@ -377,11 +470,9 @@ class _HomePageState extends State<HomePage>
         _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
       }
     } else {
-      // 从连续识别切换到单张拍摄
       setState(() {
         _isVideoStreamMode = false;
       });
-      _stopFrameCapture();
       _channel?.sink.close();
     }
   }
@@ -398,7 +489,77 @@ class _HomePageState extends State<HomePage>
     }
   }
 
-  // 添加处理霓虹光效果的方法
+  // 添加震动控制方法
+  Future<void> _startVibration(bool isGreen) async {
+    // 停止之前的震动
+    _stopVibration();
+
+    try {
+      // 检查设备是否支持震动
+      final hasVibrator = await Vibration.hasVibrator() ?? false;
+      print('设备是否支持震动: $hasVibrator');
+      if (!hasVibrator) {
+        print('设备不支持震动，无法使用震动功能');
+        return;
+      }
+
+      // 检查设备是否支持自定义震动强度
+      final hasAmplitudeControl =
+          await Vibration.hasCustomVibrationsSupport() ?? false;
+      print('设备是否支持自定义震动强度: $hasAmplitudeControl');
+
+      // 检查设备是否支持自定义震动频率
+      final hasPattern = await Vibration.hasVibrator() ?? false;
+      print('设备是否支持自定义震动模式: $hasPattern');
+
+      // 尝试一个简单的震动测试
+      print('执行震动测试...');
+      await Vibration.vibrate(duration: 200);
+      print('震动测试完成');
+
+      if (isGreen) {
+        print('开始绿灯快速震动模式');
+        // 绿灯：快速震动（200ms间隔）
+        _vibrationTimer =
+            Timer.periodic(const Duration(milliseconds: 200), (timer) async {
+          try {
+            await Vibration.vibrate(
+              duration: 100,
+              amplitude: hasAmplitudeControl ? 128 : -1,
+            );
+            print('绿灯震动执行完成');
+          } catch (e) {
+            print('绿灯震动执行错误: $e');
+          }
+        });
+      } else {
+        print('开始红灯慢速震动模式');
+        // 红灯：慢速震动（1000ms间隔）
+        _vibrationTimer =
+            Timer.periodic(const Duration(milliseconds: 1000), (timer) async {
+          try {
+            await Vibration.vibrate(
+              duration: 500,
+              amplitude: hasAmplitudeControl ? 255 : -1,
+            );
+            print('红灯震动执行完成');
+          } catch (e) {
+            print('红灯震动执行错误: $e');
+          }
+        });
+      }
+    } catch (e) {
+      print('震动控制错误: $e');
+    }
+  }
+
+  void _stopVibration() {
+    print('停止震动');
+    _vibrationTimer?.cancel();
+    Vibration.cancel();
+  }
+
+  // 修改显示效果的方法
   void _showGlowEffect(Color color) {
     setState(() {
       _glowColor = color;
@@ -407,25 +568,43 @@ class _HomePageState extends State<HomePage>
     // 取消之前的定时器（如果存在）
     _glowTimer?.cancel();
 
+    // 根据颜色开始相应的震动
+    if (color == Colors.red) {
+      print('检测到红灯，开始红灯震动模式');
+      _startVibration(false);
+    } else if (color == Colors.green) {
+      print('检测到绿灯，开始绿灯震动模式');
+      _startVibration(true);
+    } else {
+      print('未检测到信号灯，停止震动');
+      _stopVibration();
+    }
+
     // 设置新的定时器，3秒后恢复透明
     _glowTimer = Timer(const Duration(seconds: 3), () {
       if (mounted) {
         setState(() {
           _glowColor = Colors.transparent;
         });
+        _stopVibration();
       }
     });
   }
 
   @override
   void dispose() {
+    ambiguate(WidgetsBinding.instance)!.removeObserver(this);
+    _redLightPlayer.dispose();
+    _greenLightPlayer.dispose();
+    _noLightPlayer.dispose();
     _glowController.dispose();
     _glowTimer?.cancel();
-    _stopFrameCapture();
+    _stopVibration();
+    _vibrationTimer?.cancel();
     _camera?.dispose();
     _detector.dispose();
     _channel?.sink.close();
-    _flutterTts?.stop();
+    _lastSpeakTime = null;
     super.dispose();
   }
 
@@ -447,6 +626,7 @@ class _HomePageState extends State<HomePage>
 
   @override
   Widget build(BuildContext context) {
+    // 获取屏幕方向
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
@@ -458,6 +638,7 @@ class _HomePageState extends State<HomePage>
         elevation: 0,
         toolbarHeight: 0,
       ),
+      // 使用 OrientationBuilder 来处理屏幕旋转
       body: SafeArea(
         child: Stack(
           children: [
@@ -494,333 +675,335 @@ class _HomePageState extends State<HomePage>
                   },
                 ),
               ),
-            // 主要内容
-            isLandscape
-                ? Row(
-                    children: [
-                      // 相机预览区域
-                      Expanded(
-                        flex: 2,
-                        child: Stack(
-                          children: [
-                            // 虚化背景
-                            if (_camera?.value.isInitialized ?? false)
-                              Positioned.fill(
-                                child: BackdropFilter(
-                                  filter: ImageFilter.blur(
-                                    sigmaX: 10.0,
-                                    sigmaY: 10.0,
-                                  ),
-                                  child: Container(
-                                    color: Colors.transparent,
-                                  ),
-                                ),
-                              ),
-                            // 清晰的预览窗口
-                            Container(
-                              margin: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                border: Border.all(
-                                  color: _glowColor != Colors.transparent
-                                      ? _glowColor.withOpacity(0.5)
-                                      : Colors.white30,
-                                  width: 2,
-                                ),
-                                borderRadius: BorderRadius.circular(12),
-                                boxShadow: _glowColor != Colors.transparent
-                                    ? [
-                                        BoxShadow(
-                                          color: _glowColor.withOpacity(0.3),
-                                          blurRadius: 20,
-                                          spreadRadius: 5,
-                                        ),
-                                      ]
-                                    : null,
-                              ),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(10),
-                                child: _buildCameraPreview(),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      // 状态和控制区域
-                      Container(
-                        width: MediaQuery.of(context).size.width * 0.35,
-                        decoration: const BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.horizontal(
-                            left: Radius.circular(32),
-                          ),
-                        ),
-                        padding: const EdgeInsets.all(24),
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 24,
-                                vertical: 16,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.grey[100],
-                                borderRadius: BorderRadius.circular(16),
-                              ),
-                              child: Row(
-                                children: [
-                                  Container(
-                                    width: 12,
-                                    height: 12,
-                                    decoration: BoxDecoration(
-                                      color: _isProcessing
-                                          ? Colors.orange
-                                          : _glowColor != Colors.transparent
-                                              ? _glowColor
-                                              : Colors.green,
-                                      shape: BoxShape.circle,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Text(
-                                      _status,
-                                      style: const TextStyle(
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(height: 24),
-                            SizedBox(
-                              width: double.infinity,
-                              height: 56,
-                              child: ElevatedButton(
-                                onPressed: _toggleMode,
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: const Color(0xFF2C3E50),
-                                  foregroundColor: Colors.white,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(16),
-                                  ),
-                                  elevation: 0,
-                                ),
-                                child: Text(
-                                  _isVideoStreamMode ? '切换到单张拍摄' : '切换到连续识别',
-                                  style: const TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 24),
-                            if (!_isVideoStreamMode)
-                              SizedBox(
-                                width: double.infinity,
-                                height: 56,
-                                child: ElevatedButton(
-                                  onPressed: _isProcessing
-                                      ? null
-                                      : _detectTrafficLight,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFF2C3E50),
-                                    foregroundColor: Colors.white,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(16),
-                                    ),
-                                    elevation: 0,
-                                  ),
-                                  child: Text(
-                                    _isProcessing ? '识别中...' : '开始识别',
-                                    style: const TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            if (!_isVideoStreamMode) const SizedBox(height: 16),
-                            Text(
-                              _isVideoStreamMode
-                                  ? '正在连续识别中...'
-                                  : '将手机对准红绿灯，点击按钮开始识别',
-                              style: TextStyle(
-                                color: Colors.grey[600],
-                                fontSize: 14,
-                              ),
-                              textAlign: TextAlign.center,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  )
-                : Column(
-                    children: [
-                      // 竖屏布局保持不变
-                      Expanded(
-                        flex: 3,
-                        child: Stack(
-                          children: [
-                            if (_camera?.value.isInitialized ?? false)
-                              Positioned.fill(
-                                child: BackdropFilter(
-                                  filter: ImageFilter.blur(
-                                    sigmaX: 10.0,
-                                    sigmaY: 10.0,
-                                  ),
-                                  child: Container(
-                                    color: Colors.transparent,
-                                  ),
-                                ),
-                              ),
-                            Container(
-                              margin: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                border: Border.all(
-                                  color: _glowColor != Colors.transparent
-                                      ? _glowColor.withOpacity(0.5)
-                                      : Colors.white30,
-                                  width: 2,
-                                ),
-                                borderRadius: BorderRadius.circular(12),
-                                boxShadow: _glowColor != Colors.transparent
-                                    ? [
-                                        BoxShadow(
-                                          color: _glowColor.withOpacity(0.3),
-                                          blurRadius: 20,
-                                          spreadRadius: 5,
-                                        ),
-                                      ]
-                                    : null,
-                              ),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(10),
-                                child: _buildCameraPreview(),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Container(
-                        padding: const EdgeInsets.all(24),
-                        decoration: const BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.vertical(
-                            top: Radius.circular(32),
-                          ),
-                        ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 24,
-                                vertical: 16,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.grey[100],
-                                borderRadius: BorderRadius.circular(16),
-                              ),
-                              child: Row(
-                                children: [
-                                  Container(
-                                    width: 12,
-                                    height: 12,
-                                    decoration: BoxDecoration(
-                                      color: _isProcessing
-                                          ? Colors.orange
-                                          : _glowColor != Colors.transparent
-                                              ? _glowColor
-                                              : Colors.green,
-                                      shape: BoxShape.circle,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Text(
-                                      _status,
-                                      style: const TextStyle(
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(height: 24),
-                            SizedBox(
-                              width: double.infinity,
-                              height: 56,
-                              child: ElevatedButton(
-                                onPressed: _toggleMode,
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: const Color(0xFF2C3E50),
-                                  foregroundColor: Colors.white,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(16),
-                                  ),
-                                  elevation: 0,
-                                ),
-                                child: Text(
-                                  _isVideoStreamMode ? '切换到单张拍摄' : '切换到连续识别',
-                                  style: const TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 24),
-                            if (!_isVideoStreamMode)
-                              SizedBox(
-                                width: double.infinity,
-                                height: 56,
-                                child: ElevatedButton(
-                                  onPressed: _isProcessing
-                                      ? null
-                                      : _detectTrafficLight,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFF2C3E50),
-                                    foregroundColor: Colors.white,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(16),
-                                    ),
-                                    elevation: 0,
-                                  ),
-                                  child: Text(
-                                    _isProcessing ? '识别中...' : '开始识别',
-                                    style: const TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            if (!_isVideoStreamMode) const SizedBox(height: 16),
-                            Text(
-                              _isVideoStreamMode
-                                  ? '正在连续识别中...'
-                                  : '将手机对准红绿灯，点击按钮开始识别',
-                              style: TextStyle(
-                                color: Colors.grey[600],
-                                fontSize: 14,
-                              ),
-                              textAlign: TextAlign.center,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
+            // 主要内容布局
+            isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout(),
           ],
         ),
       ),
     );
   }
+
+  // 将横屏布局抽取为单独的方法
+  Widget _buildLandscapeLayout() {
+    return Row(
+      children: [
+        // 相机预览区域
+        Expanded(
+          flex: 2,
+          child: Stack(
+            children: [
+              // 虚化背景
+              if (_camera?.value.isInitialized ?? false)
+                Positioned.fill(
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(
+                      sigmaX: 10.0,
+                      sigmaY: 10.0,
+                    ),
+                    child: Container(
+                      color: Colors.transparent,
+                    ),
+                  ),
+                ),
+              // 清晰的预览窗口
+              Container(
+                margin: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  border: Border.all(
+                    color: _glowColor != Colors.transparent
+                        ? _glowColor.withOpacity(0.5)
+                        : Colors.white30,
+                    width: 2,
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: _glowColor != Colors.transparent
+                      ? [
+                          BoxShadow(
+                            color: _glowColor.withOpacity(0.3),
+                            blurRadius: 20,
+                            spreadRadius: 5,
+                          ),
+                        ]
+                      : null,
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: _buildCameraPreview(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // 状态和控制区域
+        Container(
+          width: MediaQuery.of(context).size.width * 0.35,
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.horizontal(
+              left: Radius.circular(32),
+            ),
+          ),
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 16,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.grey[100],
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        color: _isProcessing
+                            ? Colors.orange
+                            : _glowColor != Colors.transparent
+                                ? _glowColor
+                                : Colors.green,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _status,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                height: 56,
+                child: ElevatedButton(
+                  onPressed: _toggleMode,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2C3E50),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    elevation: 0,
+                  ),
+                  child: Text(
+                    _isVideoStreamMode ? '切换到单张拍摄' : '切换到连续识别',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 24),
+              if (!_isVideoStreamMode)
+                SizedBox(
+                  width: double.infinity,
+                  height: 56,
+                  child: ElevatedButton(
+                    onPressed: _isProcessing ? null : _detectTrafficLight,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF2C3E50),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      elevation: 0,
+                    ),
+                    child: Text(
+                      _isProcessing ? '识别中...' : '开始识别',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              if (!_isVideoStreamMode) const SizedBox(height: 16),
+              Text(
+                _isVideoStreamMode ? '正在连续识别中...' : '将手机对准红绿灯，点击按钮开始识别',
+                style: TextStyle(
+                  color: Colors.grey[600],
+                  fontSize: 14,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  // 将竖屏布局抽取为单独的方法
+  Widget _buildPortraitLayout() {
+    return Column(
+      children: [
+        Expanded(
+          flex: 3,
+          child: Stack(
+            children: [
+              if (_camera?.value.isInitialized ?? false)
+                Positioned.fill(
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(
+                      sigmaX: 10.0,
+                      sigmaY: 10.0,
+                    ),
+                    child: Container(
+                      color: Colors.transparent,
+                    ),
+                  ),
+                ),
+              Container(
+                margin: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  border: Border.all(
+                    color: _glowColor != Colors.transparent
+                        ? _glowColor.withOpacity(0.5)
+                        : Colors.white30,
+                    width: 2,
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: _glowColor != Colors.transparent
+                      ? [
+                          BoxShadow(
+                            color: _glowColor.withOpacity(0.3),
+                            blurRadius: 20,
+                            spreadRadius: 5,
+                          ),
+                        ]
+                      : null,
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: _buildCameraPreview(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.all(24),
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(
+              top: Radius.circular(32),
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 16,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.grey[100],
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        color: _isProcessing
+                            ? Colors.orange
+                            : _glowColor != Colors.transparent
+                                ? _glowColor
+                                : Colors.green,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _status,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                height: 56,
+                child: ElevatedButton(
+                  onPressed: _toggleMode,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2C3E50),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    elevation: 0,
+                  ),
+                  child: Text(
+                    _isVideoStreamMode ? '切换到单张拍摄' : '切换到连续识别',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 24),
+              if (!_isVideoStreamMode)
+                SizedBox(
+                  width: double.infinity,
+                  height: 56,
+                  child: ElevatedButton(
+                    onPressed: _isProcessing ? null : _detectTrafficLight,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF2C3E50),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      elevation: 0,
+                    ),
+                    child: Text(
+                      _isProcessing ? '识别中...' : '开始识别',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              if (!_isVideoStreamMode) const SizedBox(height: 16),
+              Text(
+                _isVideoStreamMode ? '正在连续识别中...' : '将手机对准红绿灯，点击按钮开始识别',
+                style: TextStyle(
+                  color: Colors.grey[600],
+                  fontSize: 14,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
 }
+
+// 添加ambiguate函数
+T? ambiguate<T>(T? value) => value;
