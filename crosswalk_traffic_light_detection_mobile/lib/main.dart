@@ -12,6 +12,7 @@ import 'package:audio_session/audio_session.dart';
 import 'package:vibration/vibration.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:light/light.dart';
+import 'package:flutter/services.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -332,43 +333,80 @@ class _HomePageState extends State<HomePage>
       _channel!.stream.listen(
         (message) {
           if (message is String) {
-            final Map<String, dynamic> jsonResponse = json.decode(message);
-            if (mounted && jsonResponse['code'] == 200) {
-              final data = jsonResponse['data'];
-              setState(() {
-                final now = DateTime.now();
-                final shouldSpeak = _lastSpeakTime == null ||
-                    now.difference(_lastSpeakTime!) >= _minSpeakInterval;
+            try {
+              final Map<String, dynamic> jsonResponse = json.decode(message);
 
-                switch (data['result']) {
-                  case '0':
-                    _status = '检测到${data['status']}';
-                    if (shouldSpeak) {
-                      _speakResult('红灯');
-                      _lastSpeakTime = now;
-                    }
-                    _showGlowEffect(Colors.red);
-                    break;
-                  case '1':
-                    _status = '检测到${data['status']}';
-                    if (shouldSpeak) {
-                      _speakResult('绿灯');
-                      _lastSpeakTime = now;
-                    }
-                    _showGlowEffect(Colors.green);
-                    break;
-                  case '2':
-                    _status = data['status'];
-                    if (shouldSpeak) {
-                      _speakResult('未检测到信号灯');
-                      _lastSpeakTime = now;
-                    }
-                    _showGlowEffect(Colors.transparent);
-                    break;
+              // 处理错误响应
+              if (jsonResponse['code'] != 200) {
+                // 获取错误信息
+                final errorMessage = jsonResponse['message'] ?? '未知错误';
+                final errorDetails = jsonResponse['data']?['error'] ?? '';
+
+                print('服务器错误: $errorMessage, 详情: $errorDetails');
+
+                if (mounted) {
+                  // 显示错误通知
+                  _showErrorNotification(
+                    title: '服务器错误 (${jsonResponse['code']})',
+                    message: errorMessage,
+                    details: errorDetails,
+                  );
+
+                  // 如果是严重错误，可以切换到单张识别模式
+                  if (jsonResponse['code'] == 500) {
+                    setState(() {
+                      _isVideoStreamMode = false;
+                    });
+                  }
                 }
-              });
-            } else {
-              print('服务器响应错误: ${jsonResponse['message']}');
+                return;
+              }
+
+              // 正常响应处理
+              if (mounted && jsonResponse['code'] == 200) {
+                final data = jsonResponse['data'];
+                setState(() {
+                  final now = DateTime.now();
+                  final shouldSpeak = _lastSpeakTime == null ||
+                      now.difference(_lastSpeakTime!) >= _minSpeakInterval;
+
+                  switch (data['result']) {
+                    case '0':
+                      _status = '检测到${data['status']}';
+                      if (shouldSpeak) {
+                        _speakResult('红灯');
+                        _lastSpeakTime = now;
+                      }
+                      _showGlowEffect(Colors.red);
+                      break;
+                    case '1':
+                      _status = '检测到${data['status']}';
+                      if (shouldSpeak) {
+                        _speakResult('绿灯');
+                        _lastSpeakTime = now;
+                      }
+                      _showGlowEffect(Colors.green);
+                      break;
+                    case '2':
+                      _status = data['status'];
+                      if (shouldSpeak) {
+                        _speakResult('未检测到信号灯');
+                        _lastSpeakTime = now;
+                      }
+                      _showGlowEffect(Colors.transparent);
+                      break;
+                  }
+                });
+              }
+            } catch (e) {
+              print('解析响应数据错误: $e');
+              if (mounted) {
+                _showErrorNotification(
+                  title: '数据处理错误',
+                  message: '无法解析服务器响应',
+                  details: e.toString(),
+                );
+              }
             }
           }
         },
@@ -386,7 +424,11 @@ class _HomePageState extends State<HomePage>
             setState(() {
               _isVideoStreamMode = false;
             });
-            _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
+            _showErrorNotification(
+              title: 'WebSocket错误',
+              message: '连接服务器失败，已切换到单张识别模式',
+              details: error.toString(),
+            );
           }
         },
       );
@@ -396,7 +438,11 @@ class _HomePageState extends State<HomePage>
         setState(() {
           _isVideoStreamMode = false;
         });
-        _showErrorSnackBar('连接服务器失败，已切换到单张识别模式');
+        _showErrorNotification(
+          title: '连接错误',
+          message: '无法连接到服务器',
+          details: e.toString(),
+        );
       }
       rethrow;
     }
@@ -1179,6 +1225,104 @@ class _HomePageState extends State<HomePage>
           );
         }).toList();
       },
+    );
+  }
+
+  // 添加错误通知方法
+  void _showErrorNotification({
+    required String title,
+    required String message,
+    String? details,
+  }) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(message),
+            if (details != null && details.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              GestureDetector(
+                onTap: () => _showErrorDetails(title, details),
+                child: const Text(
+                  '点击查看详细信息',
+                  style: TextStyle(
+                    decoration: TextDecoration.underline,
+                    color: Colors.white70,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        backgroundColor: Colors.red,
+        duration: const Duration(seconds: 5),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+        action: SnackBarAction(
+          label: '关闭',
+          textColor: Colors.white,
+          onPressed: () {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          },
+        ),
+      ),
+    );
+  }
+
+  // 显示错误详情的对话框
+  void _showErrorDetails(String title, String details) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '错误详情:',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(details),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+          TextButton(
+            onPressed: () {
+              // 复制错误信息到剪贴板
+              Clipboard.setData(ClipboardData(text: details));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('错误信息已复制到剪贴板'),
+                  duration: Duration(seconds: 2),
+                ),
+              );
+            },
+            child: const Text('复制'),
+          ),
+        ],
+      ),
     );
   }
 }
