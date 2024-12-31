@@ -11,6 +11,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:vibration/vibration.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:light/light.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -73,6 +74,13 @@ class _HomePageState extends State<HomePage>
   static const Duration _minSpeakInterval =
       Duration(seconds: 30); // 设置最小播报间隔为30秒
 
+  Light? _light;
+  StreamSubscription? _lightSubscription;
+  bool _torchEnabled = false;
+  static const int LOW_LIGHT_THRESHOLD = 10; // 低光阈值，可根据需要调整
+  List<LightSensor>? _availableLightSensors;
+  LightSensor? _currentLightSensor;
+
   @override
   void initState() {
     super.initState();
@@ -85,6 +93,7 @@ class _HomePageState extends State<HomePage>
 
     // 使用异步初始化
     _initializeApp();
+    _initLightSensor();
   }
 
   Future<void> _initializeApp() async {
@@ -305,9 +314,6 @@ class _HomePageState extends State<HomePage>
           try {
             final XFile image = await _camera!.takePicture();
             final bytes = await image.readAsBytes();
-
-            // 压缩图片
-            final img = await decodeImageFromList(bytes);
             final resizedImg = await FlutterImageCompress.compressWithList(
               bytes,
               minHeight: 480, // 设置最小高度
@@ -412,7 +418,7 @@ class _HomePageState extends State<HomePage>
     // 使用较低的分辨率和更高效的图像格式
     _camera = CameraController(
       cameras[0],
-      ResolutionPreset.medium, // 降低分辨率，从 veryHigh 改为 medium
+      ResolutionPreset.medium,
       enableAudio: false,
       imageFormatGroup: Platform.isAndroid
           ? ImageFormatGroup.jpeg
@@ -421,6 +427,15 @@ class _HomePageState extends State<HomePage>
 
     try {
       await _camera!.initialize();
+      // 尝试获取闪光灯状态来检查是否支持闪光灯
+      try {
+        final currentFlashMode = _camera!.value.flashMode;
+        print('当前闪光灯模式: $currentFlashMode');
+        print('设备支持闪光灯控制');
+      } catch (e) {
+        print('设备可能不支持闪光灯: $e');
+      }
+
       if (mounted) {
         setState(() {});
       }
@@ -620,6 +635,88 @@ class _HomePageState extends State<HomePage>
     });
   }
 
+  // 修改光线传感器初始化方法
+  Future<void> _initLightSensor() async {
+    _light = Light();
+    try {
+      // 获取所有可用的照度传感器
+      _availableLightSensors = await _light!.getLightSensors();
+      if (_availableLightSensors?.isEmpty ?? true) {
+        print('没有找到可用的照度传感器');
+        return;
+      }
+
+      // 打印所有可用的传感器信息
+      for (var sensor in _availableLightSensors!) {
+        print('发现照度传感器: ${sensor.name} (${sensor.vendor}) - ID: ${sensor.id}');
+      }
+
+      // 默认使用第一个传感器
+      _currentLightSensor = _availableLightSensors![0];
+      print('使用默认传感器: ${_currentLightSensor!.name}');
+
+      // 开始监听选定的传感器数据
+      _lightSubscription = _light?.lightSensorStream.listen((lux) {
+        print('当前环境光照度: $lux lux (使用传感器: ${_currentLightSensor!.name})');
+        _handleLowLight(lux);
+      });
+    } catch (e) {
+      print('光线传感器初始化失败: $e');
+    }
+  }
+
+  // 添加切换传感器的方法
+  Future<void> _switchLightSensor(LightSensor newSensor) async {
+    try {
+      // 取消当前的监听
+      await _lightSubscription?.cancel();
+
+      // 设置新的传感器
+      final success = await _light!.setLightSensor(newSensor.id);
+      if (success) {
+        setState(() {
+          _currentLightSensor = newSensor;
+        });
+
+        // 重新开始监听
+        _lightSubscription = _light?.lightSensorStream.listen((lux) {
+          print('当前环境光照度: $lux lux (使用传感器: ${_currentLightSensor!.name})');
+          _handleLowLight(lux);
+        });
+
+        print('成功切换到传感器: ${newSensor.name}');
+      } else {
+        print('切换传感器失败');
+      }
+    } catch (e) {
+      print('切换传感器时出错: $e');
+    }
+  }
+
+  // 处理低光情况
+  void _handleLowLight(int lux) async {
+    if (_camera == null || !_camera!.value.isInitialized) return;
+
+    try {
+      final currentFlashMode = _camera!.value.flashMode;
+
+      if (lux < LOW_LIGHT_THRESHOLD && currentFlashMode != FlashMode.torch) {
+        // 在低光环境下开启闪光灯
+        await _camera!.setFlashMode(FlashMode.torch);
+        setState(() => _torchEnabled = true);
+        print('检测到低光环境，开启补光');
+      } else if (lux >= LOW_LIGHT_THRESHOLD &&
+          currentFlashMode == FlashMode.torch) {
+        // 在足够亮度时关闭闪光灯
+        await _camera!.setFlashMode(FlashMode.off);
+        setState(() => _torchEnabled = false);
+        print('环境光线充足，关闭补光');
+      }
+    } catch (e) {
+      print('闪光灯控制错误: $e');
+    }
+  }
+
   @override
   void dispose() {
     ambiguate(WidgetsBinding.instance)!.removeObserver(this);
@@ -634,6 +731,10 @@ class _HomePageState extends State<HomePage>
     _detector.dispose();
     _channel?.sink.close();
     _lastSpeakTime = null;
+    _lightSubscription?.cancel();
+    if (_torchEnabled && _camera != null) {
+      _camera!.setFlashMode(FlashMode.off);
+    }
     super.dispose();
   }
 
@@ -662,52 +763,54 @@ class _HomePageState extends State<HomePage>
     return Scaffold(
       backgroundColor: Colors.black,
       extendBodyBehindAppBar: true,
-      appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        toolbarHeight: 0,
-      ),
-      // 使用 OrientationBuilder 来处理屏幕旋转
-      body: SafeArea(
-        child: Stack(
-          children: [
-            // 背景相机预览
-            if (_camera?.value.isInitialized ?? false)
-              Positioned.fill(
-                child: CameraPreview(_camera!),
-              ),
-            // 霓虹光效果
-            if (_glowColor != Colors.transparent)
-              Positioned.fill(
-                child: AnimatedBuilder(
-                  animation: _glowController,
-                  builder: (context, child) {
-                    return Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(
-                          color: _glowColor.withOpacity(
-                            0.3 + 0.7 * _glowController.value,
-                          ),
-                          width: 20,
+      appBar: null,
+      body: Stack(
+        children: [
+          // 背景相机预览
+          if (_camera?.value.isInitialized ?? false)
+            Positioned.fill(
+              child: CameraPreview(_camera!),
+            ),
+          // 霓虹光效果
+          if (_glowColor != Colors.transparent)
+            Positioned.fill(
+              child: AnimatedBuilder(
+                animation: _glowController,
+                builder: (context, child) {
+                  return Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: _glowColor.withOpacity(
+                          0.3 + 0.7 * _glowController.value,
                         ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: _glowColor.withOpacity(
-                              0.2 + 0.3 * _glowController.value,
-                            ),
-                            blurRadius: 30,
-                            spreadRadius: 10,
-                          ),
-                        ],
+                        width: 20,
                       ),
-                    );
-                  },
-                ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: _glowColor.withOpacity(
+                            0.2 + 0.3 * _glowController.value,
+                          ),
+                          blurRadius: 30,
+                          spreadRadius: 10,
+                        ),
+                      ],
+                    ),
+                  );
+                },
               ),
-            // 主要内容布局
-            isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout(),
-          ],
-        ),
+            ),
+          // 主要内容布局
+          SafeArea(
+            child:
+                isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout(),
+          ),
+          // 添加浮动的传感器选择按钮
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 8, // 考虑状态栏高度
+            right: 8,
+            child: _buildSensorSelector(),
+          ),
+        ],
       ),
     );
   }
@@ -1030,6 +1133,52 @@ class _HomePageState extends State<HomePage>
           ),
         ),
       ],
+    );
+  }
+
+  // 可以在UI中添加一个切换传感器的按钮或菜单
+  Widget _buildSensorSelector() {
+    if (_availableLightSensors == null || _availableLightSensors!.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return PopupMenuButton<LightSensor>(
+      icon: const Icon(
+        Icons.sensors,
+        color: Colors.white,
+      ),
+      tooltip: '选择光线传感器',
+      onSelected: _switchLightSensor,
+      itemBuilder: (context) {
+        return _availableLightSensors!.map((sensor) {
+          return PopupMenuItem<LightSensor>(
+            value: sensor,
+            child: Row(
+              children: [
+                Icon(
+                  Icons.check,
+                  color: sensor.id == _currentLightSensor?.id
+                      ? Colors.green
+                      : Colors.transparent,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '${sensor.name}\n${sensor.vendor}',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: sensor.id == _currentLightSensor?.id
+                          ? Colors.green
+                          : null,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }).toList();
+      },
     );
   }
 }

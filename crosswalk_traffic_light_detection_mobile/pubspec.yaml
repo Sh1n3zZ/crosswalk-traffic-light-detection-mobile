@@ -46,6 +46,8 @@ dependencies:
   just_audio: ^0.9.42
   audio_session: ^0.1.18
   flutter_image_compress: ^2.3.0
+  light:
+    path: packages/dart-flutter-light
 
 dev_dependencies:
   flutter_test:
