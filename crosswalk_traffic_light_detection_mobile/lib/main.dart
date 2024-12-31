@@ -13,6 +13,7 @@ import 'package:vibration/vibration.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:light/light.dart';
 import 'package:flutter/services.dart';
+import 'dart:math' as math;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -81,6 +82,33 @@ class _HomePageState extends State<HomePage>
   static const int LOW_LIGHT_THRESHOLD = 10; // 低光阈值，可根据需要调整
   List<LightSensor>? _availableLightSensors;
   LightSensor? _currentLightSensor;
+
+  // 添加变焦相关变量
+  double _currentZoom = 1.0;
+  double _baseZoom = 1.0;
+  Timer? _zoomResetTimer;
+
+  // 添加平滑过渡相关变量
+  double _targetZoom = 1.0;
+  Timer? _smoothZoomTimer;
+  static const double ZOOM_STEP = 0.05; // 更小的步进值
+  static const int ZOOM_INTERVAL_MS = 16; // 约60fps的更新频率
+
+  // 添加检测框状态变量
+  List<Rect> _trafficLightBoxes = [];
+  List<Rect> _crosswalkBoxes = [];
+
+  static const Duration DETECTION_TIMEOUT = Duration(seconds: 5);
+
+  // 添加采样控制变量
+  int _detectionCounter = 0;
+  static const int DETECTION_SAMPLE_INTERVAL = 5; // 每5次检测采样一次
+  DateTime? _lastDetectionTime;
+  static const int MAX_NO_DETECTION_COUNT = 3; // 最大连续未检测次数
+  static const Duration NO_DETECTION_TIMEOUT =
+      Duration(seconds: 5); // 未检测到目标的持续时间
+
+  int _noDetectionCount = 0;
 
   @override
   void initState() {
@@ -365,6 +393,10 @@ class _HomePageState extends State<HomePage>
               // 正常响应处理
               if (mounted && jsonResponse['code'] == 200) {
                 final data = jsonResponse['data'];
+
+                // 处理检测框数据
+                _processDetections(data['detections']);
+
                 setState(() {
                   final now = DateTime.now();
                   final shouldSpeak = _lastSpeakTime == null ||
@@ -763,8 +795,181 @@ class _HomePageState extends State<HomePage>
     }
   }
 
+  // 修改处理检测框的方法
+  void _processDetections(Map<String, dynamic>? detections) {
+    if (detections == null) {
+      _handleNoDetection();
+      return;
+    }
+
+    // 增加计数器
+    _detectionCounter++;
+
+    // 只在采样间隔时处理检测结果
+    if (_detectionCounter % DETECTION_SAMPLE_INTERVAL != 0) {
+      return;
+    }
+
+    try {
+      // 解析检测框
+      _trafficLightBoxes = (detections['traffic_lights'] as List?)
+              ?.map((box) => Rect.fromLTRB(
+                    box[0].toDouble(),
+                    box[1].toDouble(),
+                    box[2].toDouble(),
+                    box[3].toDouble(),
+                  ))
+              .toList() ??
+          [];
+
+      _crosswalkBoxes = (detections['crosswalks'] as List?)
+              ?.map((box) => Rect.fromLTRB(
+                    box[0].toDouble(),
+                    box[1].toDouble(),
+                    box[2].toDouble(),
+                    box[3].toDouble(),
+                  ))
+              .toList() ??
+          [];
+
+      // 如果有检测到目标
+      if (_trafficLightBoxes.isNotEmpty || _crosswalkBoxes.isNotEmpty) {
+        _noDetectionCount = 0;
+        _lastDetectionTime = DateTime.now();
+        _calculateAndApplyZoom();
+      } else {
+        _handleNoDetection();
+      }
+    } catch (e) {
+      print('处理检测框数据错误: $e');
+      _handleNoDetection();
+    }
+  }
+
+  // 修改计算和应用变焦的方法
+  Future<void> _calculateAndApplyZoom() async {
+    if (_camera == null || !_camera!.value.isInitialized) return;
+
+    try {
+      // 获取相机支持的变焦范围
+      final minZoom = await _camera!.getMinZoomLevel();
+      final maxZoom = await _camera!.getMaxZoomLevel();
+
+      // 合并所有检测框
+      final allBoxes = [..._trafficLightBoxes, ..._crosswalkBoxes];
+      if (allBoxes.isEmpty) return;
+
+      // 计算所有检测框的边界
+      double minX = double.infinity;
+      double minY = double.infinity;
+      double maxX = double.negativeInfinity;
+      double maxY = double.negativeInfinity;
+
+      for (final box in allBoxes) {
+        minX = math.min(minX, box.left);
+        minY = math.min(minY, box.top);
+        maxX = math.max(maxX, box.right);
+        maxY = math.max(maxY, box.bottom);
+      }
+
+      // 计算预览尺寸
+      final previewSize = _camera!.value.previewSize!;
+
+      // 计算缩放比例
+      final widthRatio = previewSize.width / (maxX - minX);
+      final heightRatio = previewSize.height / (maxY - minY);
+      final zoomLevel = math.min(widthRatio, heightRatio);
+
+      // 设置目标变焦值
+      _targetZoom = math.min(maxZoom, math.max(minZoom, zoomLevel));
+
+      // 启动平滑过渡
+      _startSmoothZoom();
+    } catch (e) {
+      print('计算变焦错误: $e');
+    }
+  }
+
+  // 添加平滑变焦方法
+  void _startSmoothZoom() {
+    // 取消现有的平滑过渡定时器
+    _smoothZoomTimer?.cancel();
+
+    // 创建新的定时器进行平滑过渡
+    _smoothZoomTimer = Timer.periodic(
+      const Duration(milliseconds: ZOOM_INTERVAL_MS),
+      (timer) async {
+        if (!mounted) {
+          timer.cancel();
+          return;
+        }
+
+        try {
+          // 计算当前帧的变焦值
+          final double step = (_targetZoom - _currentZoom).abs() * 0.1;
+          final double smoothStep = math.max(ZOOM_STEP, step);
+
+          if ((_targetZoom - _currentZoom).abs() < ZOOM_STEP) {
+            // 如果接近目标值，直接设置为目标值
+            if (_currentZoom != _targetZoom) {
+              await _camera!.setZoomLevel(_targetZoom);
+              setState(() => _currentZoom = _targetZoom);
+            }
+            timer.cancel();
+          } else {
+            // 逐步接近目标值
+            final double newZoom = _currentZoom < _targetZoom
+                ? math.min(_currentZoom + smoothStep, _targetZoom)
+                : math.max(_currentZoom - smoothStep, _targetZoom);
+
+            await _camera!.setZoomLevel(newZoom);
+            setState(() => _currentZoom = newZoom);
+          }
+        } catch (e) {
+          print('平滑变焦错误: $e');
+          timer.cancel();
+        }
+      },
+    );
+  }
+
+  // 修改重置变焦的方法
+  Future<void> _resetZoom() async {
+    _detectionCounter = 0;
+    if (_camera == null || !_camera!.value.isInitialized) return;
+
+    try {
+      final minZoom = await _camera!.getMinZoomLevel();
+      _targetZoom = minZoom;
+      _startSmoothZoom();
+
+      setState(() {
+        _trafficLightBoxes = [];
+        _crosswalkBoxes = [];
+      });
+    } catch (e) {
+      print('重置变焦错误: $e');
+    }
+  }
+
+  void _handleNoDetection() {
+    final now = DateTime.now();
+    final hasTimeout = _lastDetectionTime != null &&
+        now.difference(_lastDetectionTime!) > DETECTION_TIMEOUT;
+
+    _noDetectionCount++;
+
+    if (_noDetectionCount >= MAX_NO_DETECTION_COUNT || hasTimeout) {
+      _resetZoom();
+      _noDetectionCount = 0;
+      _lastDetectionTime = null;
+    }
+  }
+
   @override
   void dispose() {
+    _smoothZoomTimer?.cancel();
+    _zoomResetTimer?.cancel();
     ambiguate(WidgetsBinding.instance)!.removeObserver(this);
     _redLightPlayer.dispose();
     _greenLightPlayer.dispose();
