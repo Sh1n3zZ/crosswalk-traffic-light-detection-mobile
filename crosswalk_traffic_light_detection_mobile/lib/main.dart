@@ -85,7 +85,6 @@ class _HomePageState extends State<HomePage>
 
   // 添加变焦相关变量
   double _currentZoom = 1.0;
-  double _baseZoom = 1.0;
   Timer? _zoomResetTimer;
 
   // 添加平滑过渡相关变量
@@ -105,8 +104,6 @@ class _HomePageState extends State<HomePage>
   static const int DETECTION_SAMPLE_INTERVAL = 5; // 每5次检测采样一次
   DateTime? _lastDetectionTime;
   static const int MAX_NO_DETECTION_COUNT = 3; // 最大连续未检测次数
-  static const Duration NO_DETECTION_TIMEOUT =
-      Duration(seconds: 5); // 未检测到目标的持续时间
 
   int _noDetectionCount = 0;
 
@@ -323,7 +320,7 @@ class _HomePageState extends State<HomePage>
   Future<void> _initWebSocket() async {
     try {
       _channel = WebSocketChannel.connect(
-          Uri.parse('ws://175.178.245.188:27015/ws/video-stream'));
+          Uri.parse('wss://cr.rakuyou.uk/ws/video-stream'));
 
       await _channel!.ready.timeout(
         const Duration(seconds: 5),

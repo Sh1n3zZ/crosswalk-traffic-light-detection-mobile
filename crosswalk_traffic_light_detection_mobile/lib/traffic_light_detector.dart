@@ -13,7 +13,7 @@ enum TrafficLightStatus {
 }
 
 class TrafficLightDetector {
-  static const String serverUrl = 'http://175.178.245.188:27015/detect';
+  static const String serverUrl = 'https://cr.rakuyou.uk/detect';
 
   TrafficLightDetector();
 
