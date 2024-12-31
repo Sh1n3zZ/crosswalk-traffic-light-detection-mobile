@@ -1,0 +1,3 @@
+[submodule "crosswalk_traffic_light_detection_mobile/packages/dart-flutter-light"]
+	path = crosswalk_traffic_light_detection_mobile/packages/dart-flutter-light
+	url = https://github.com/Sh1n3zZ/dart-flutter-light.git
